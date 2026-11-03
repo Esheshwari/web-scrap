@@ -1,0 +1,20 @@
+{
+  "name": "b2b-lead-finder",
+  "version": "1.0.0",
+  "private": true,
+  "main": "node_modules/expo/AppEntry.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android"
+  },
+  "dependencies": {
+    "@expo/metro-runtime": "~5.0.5",
+    "expo": "~53.0.0",
+    "expo-file-system": "~18.1.11",
+    "expo-sharing": "~13.1.5",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "react-native": "0.79.6",
+    "react-native-web": "^0.20.0"
+  }
+}

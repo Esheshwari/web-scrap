@@ -1,0 +1,136 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Expo Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install JavaScript dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Check EAS credentials
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
+          EXPO_PUBLIC_API_URL: ${{ secrets.EXPO_PUBLIC_API_URL }}
+        run: |
+          if [ -z "$EXPO_TOKEN" ]; then
+            echo "::error::Add the EXPO_TOKEN repository secret."
+            exit 1
+          fi
+          if [ -z "$EXPO_PROJECT_ID" ]; then
+            echo "::error::Add the EXPO_PROJECT_ID repository secret for your EAS project."
+            exit 1
+          fi
+          if [ -z "$EXPO_PUBLIC_API_URL" ]; then
+            echo "::error::Add EXPO_PUBLIC_API_URL as a repository secret. It must be your deployed HTTPS backend URL, not a local Wi-Fi address."
+            exit 1
+          fi
+
+      - name: Validate backend URL
+        env:
+          EXPO_PUBLIC_API_URL: ${{ secrets.EXPO_PUBLIC_API_URL }}
+        run: |
+          node -e "const url = new URL(process.env.EXPO_PUBLIC_API_URL); if (url.protocol !== 'https:' || url.username || url.password || (url.pathname !== '/' && url.pathname !== '') || url.search || url.hash) process.exit(1)"
+          HEALTH_OK=false
+          for attempt in $(seq 1 10); do
+            if HEALTH="$(curl --fail --silent --show-error --max-time 20 "${EXPO_PUBLIC_API_URL%/}/health" 2>/dev/null)" \
+              && printf '%s' "$HEALTH" | node -e "let input=''; process.stdin.on('data', chunk => input += chunk); process.stdin.on('end', () => { try { if (JSON.parse(input).status !== 'ok') process.exitCode = 1; } catch { process.exitCode = 1; } });"; then
+              HEALTH_OK=true
+              break
+            fi
+            echo "Backend is not ready yet (attempt $attempt/10); retrying in 15 seconds."
+            sleep 15
+          done
+          if [ "$HEALTH_OK" != true ]; then
+            echo "::error::Backend health check failed after retries. Verify EXPO_PUBLIC_API_URL and the Render deploy logs."
+            exit 1
+          fi
+
+      - name: Configure EAS preview API URL
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
+          EXPO_PUBLIC_API_URL: ${{ secrets.EXPO_PUBLIC_API_URL }}
+        run: npx --yes eas-cli@latest env:set --environment preview --name EXPO_PUBLIC_API_URL --value "$EXPO_PUBLIC_API_URL" --visibility plaintext --non-interactive
+
+      - name: Validate Expo project
+        env:
+          EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
+          EXPO_PUBLIC_API_URL: ${{ secrets.EXPO_PUBLIC_API_URL }}
+        run: |
+          npx --yes expo-doctor
+          npx expo export --platform android --output-dir .expo-validation
+          rm -rf .expo-validation
+
+      - name: Start EAS APK build
+        id: start-build
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
+          EXPO_PUBLIC_API_URL: ${{ secrets.EXPO_PUBLIC_API_URL }}
+        run: |
+          npx --yes eas-cli@latest build --platform android --profile preview --non-interactive --json > build-start.json
+          BUILD_ID="$(node -e "const builds = JSON.parse(require('fs').readFileSync('build-start.json', 'utf8')); if (!Array.isArray(builds) || !builds[0] || !builds[0].id) process.exit(1); process.stdout.write(builds[0].id)")"
+          echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for EAS build
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
+          EXPO_PUBLIC_API_URL: ${{ secrets.EXPO_PUBLIC_API_URL }}
+          BUILD_ID: ${{ steps.start-build.outputs.build_id }}
+        run: |
+          for attempt in $(seq 1 240); do
+            npx --yes eas-cli@latest build:list --platform android --limit 50 --json > build-list.json
+            STATUS="$(BUILD_ID="$BUILD_ID" node -e "const builds = JSON.parse(require('fs').readFileSync('build-list.json', 'utf8')); const build = builds.find(item => item.id === process.env.BUILD_ID); if (build) process.stdout.write(build.status.toLowerCase())")"
+            case "$STATUS" in
+              finished) exit 0 ;;
+              errored|canceled)
+                echo "::error::EAS build $BUILD_ID ended with status $STATUS."
+                exit 1
+                ;;
+            esac
+            sleep 30
+          done
+          echo "::error::Timed out waiting for EAS build $BUILD_ID."
+          exit 1
+
+      - name: Download completed APK
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          EXPO_PROJECT_ID: ${{ secrets.EXPO_PROJECT_ID }}
+          EXPO_PUBLIC_API_URL: ${{ secrets.EXPO_PUBLIC_API_URL }}
+          BUILD_ID: ${{ steps.start-build.outputs.build_id }}
+        run: |
+          npx --yes eas-cli@latest build:download --build-id "$BUILD_ID" --json > download-result.json
+          node -e "const fs = require('fs'); const result = JSON.parse(fs.readFileSync('download-result.json', 'utf8')); if (!result.path || !fs.existsSync(result.path)) throw new Error('EAS did not return a downloadable APK path'); fs.copyFileSync(result.path, 'app.apk')"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: b2b-lead-finder-android-apk
+          path: app.apk
+          if-no-files-found: error
+          retention-days: 14

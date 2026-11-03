@@ -1,0 +1,9 @@
+.expo/
+.expo-validation/
+.web-preview/
+.venv/
+node_modules/
+__pycache__/
+*.py[cod]
+.env
+app.apk
