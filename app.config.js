@@ -1,4 +1,4 @@
-const projectId = process.env.EXPO_PROJECT_ID;
+const projectId = process.env.EXPO_PROJECT_ID || '43328eff-a516-4046-ba91-b7fa30cb308f';
 
 module.exports = {
   expo: {
