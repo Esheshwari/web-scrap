@@ -486,25 +486,48 @@ def _structure_leads(
         if not isinstance(model_leads, list):
             raise ValueError("Groq response must contain a leads array.")
         indexed: dict[int, dict[str, Any]] = {}
+        candidate_ids = {item["candidate_id"] for item in scraped}
+        invalid_entries = 0
         for item in model_leads:
+            if not isinstance(item, dict):
+                invalid_entries += 1
+                continue
             candidate_id = item.get("candidate_id")
-            if not isinstance(candidate_id, int) or candidate_id in indexed:
-                raise ValueError("Groq response contains an invalid candidate_id.")
+            if (
+                type(candidate_id) is not int
+                or candidate_id not in candidate_ids
+                or candidate_id in indexed
+            ):
+                invalid_entries += 1
+                continue
             if not isinstance(item.get("company_name"), str):
-                raise ValueError("Groq response contains an invalid company_name.")
+                invalid_entries += 1
+                continue
             if item.get("public_email") is not None and not isinstance(
                 item["public_email"], str
             ):
-                raise ValueError("Groq response contains an invalid public_email.")
+                invalid_entries += 1
+                continue
             if item.get("phone") is not None and not isinstance(item["phone"], str):
-                raise ValueError("Groq response contains an invalid phone.")
+                invalid_entries += 1
+                continue
             if not isinstance(item.get("potential_buyer"), bool):
-                raise ValueError("Groq response contains an invalid buyer classification.")
+                invalid_entries += 1
+                continue
             if not isinstance(item.get("buyer_fit_reasoning"), str):
-                raise ValueError("Groq response contains invalid buyer-fit reasoning.")
+                invalid_entries += 1
+                continue
             indexed[candidate_id] = item
-        if set(indexed) != {item["candidate_id"] for item in scraped}:
-            raise ValueError("Groq response does not match the submitted candidates.")
+        missing_entries = len(candidate_ids - indexed.keys())
+        if invalid_entries or missing_entries:
+            logger.warning(
+                "Groq returned %d valid analyses for %d scraped candidates; "
+                "%d entries were malformed and %d were missing.",
+                len(indexed),
+                len(scraped),
+                invalid_entries,
+                missing_entries,
+            )
     except GroqError as exc:
         logger.exception("Groq request failed for model %s", MODEL_NAME)
         status_code = getattr(exc, "status_code", None)
@@ -529,6 +552,8 @@ def _structure_leads(
     leads: list[Lead] = []
     seen_company_names: set[str] = set()
     for item in scraped:
+        if item["candidate_id"] not in indexed:
+            continue
         structured = indexed[item["candidate_id"]]
         company_name = structured["company_name"].strip()[:200]
         evidence = " ".join(item["page_titles"] + [item["site_text"]])
