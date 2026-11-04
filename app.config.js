@@ -8,6 +8,7 @@ module.exports = {
     orientation: 'portrait',
     userInterfaceStyle: 'light',
     platforms: ['android', 'ios', 'web'],
+    plugins: ['expo-asset'],
     android: {
       package: 'com.example.b2bleadfinder',
       usesCleartextTraffic: true,

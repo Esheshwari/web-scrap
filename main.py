@@ -12,6 +12,7 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
+from ddgs.exceptions import DDGSException
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -29,11 +30,49 @@ MAX_HTML_BYTES = 1_000_000
 REQUEST_TIMEOUT = (5, 12)
 MAX_REDIRECTS = 4
 MAX_LEADS = 20
+MAX_RESULTS_PER_QUERY = 6
 USER_AGENT = "B2BLeadResearch/1.0 (+public company contact research)"
+BUYER_CATEGORY_QUERIES = {
+    "Importer": "importer purchasing company",
+    "Wholesaler": "wholesaler bulk buyer",
+    "Retailer": "retailer supermarket grocery store",
+    "Manufacturer/processor": "manufacturer food processor",
+    "Food-service buyer": "restaurant hotel catering food service procurement",
+}
+DIRECTORY_DOMAINS = {
+    "accio.com",
+    "atninfo.com",
+    "eximhub.pro",
+    "go4worldbusiness.com",
+    "kompass.com",
+    "listcompany.org",
+    "tradologie.com",
+    "tradewheel.com",
+    "volza.com",
+    "yellowpages-uae.com",
+}
+DIRECTORY_TITLE_MARKERS = (
+    "buyer list",
+    "buyers list",
+    "importer list",
+    "importers list",
+    "supplier directory",
+    "suppliers list",
+    "company directory",
+    "marketplace",
+    "trade data",
+    "import data",
+    "shipment data",
+)
 
 MAILTO_RE = re.compile(r"""(?i)mailto:\s*([^"'?#\s<>]+)""")
 TEL_RE = re.compile(r"""(?i)tel:\s*([^"'?#\s<>]+)""")
 EMAIL_RE = re.compile(r"^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$", re.IGNORECASE)
+PLAIN_EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+PHONE_CONTEXT_RE = re.compile(
+    r"(?i)(?:phone|telephone|tel\.?|call us|whatsapp|mobile)"
+    r"[^\d+]{0,30}(\+?\d[\d\s().-]{5,}\d)"
+)
 
 app = FastAPI(title="B2B Lead Scraper", version="1.0.0")
 app.add_middleware(
@@ -48,6 +87,9 @@ app.add_middleware(
 class SearchRequest(BaseModel):
     product: str = Field(min_length=2, max_length=120)
     target_countries: list[str] = Field(min_length=1, max_length=8)
+    buyer_categories: list[str] = Field(
+        default_factory=lambda: ["Importer"], min_length=1, max_length=5
+    )
 
     @field_validator("product")
     @classmethod
@@ -65,9 +107,23 @@ class SearchRequest(BaseModel):
             raise ValueError("Provide at least one target country.")
         return cleaned
 
+    @field_validator("buyer_categories")
+    @classmethod
+    def validate_buyer_categories(cls, values: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(category.strip() for category in values))
+        invalid = [
+            category for category in cleaned if category not in BUYER_CATEGORY_QUERIES
+        ]
+        if invalid:
+            raise ValueError(f"Unsupported buyer categories: {', '.join(invalid)}.")
+        if not cleaned:
+            raise ValueError("Select at least one buyer category.")
+        return cleaned
+
 
 class Lead(BaseModel):
     company_name: str
+    buyer_category: str
     website_url: str
     public_email: str | None
     phone: str | None
@@ -171,7 +227,11 @@ def _tel_values(raw_html: str) -> list[str]:
     for raw_value in TEL_RE.findall(raw_html):
         number = unquote(html.unescape(raw_value)).strip().strip(".,;)")
         digits = re.sub(r"\D", "", number)
-        if 7 <= len(digits) <= 15 and number not in found:
+        if (
+            re.fullmatch(r"\+?[\d\s().-]+", number)
+            and 7 <= len(digits) <= 15
+            and number not in found
+        ):
             found.append(number)
     return found
 
@@ -185,12 +245,25 @@ def _page_content(url: str) -> dict[str, Any] | None:
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     for element in soup(["script", "style", "noscript", "svg"]):
         element.decompose()
-    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:1_200]
+    visible_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+    emails = _mailto_values(raw_html)
+    for address in PLAIN_EMAIL_RE.findall(visible_text):
+        if EMAIL_RE.fullmatch(address) and address.lower() not in {
+            email.lower() for email in emails
+        }:
+            emails.append(address)
+    phones = _tel_values(raw_html)
+    phone_digits = {re.sub(r"\D", "", phone) for phone in phones}
+    for phone in PHONE_CONTEXT_RE.findall(visible_text):
+        digits = re.sub(r"\D", "", phone)
+        if 7 <= len(digits) <= 15 and digits not in phone_digits:
+            phones.append(phone.strip())
+            phone_digits.add(digits)
     return {
         "title": title[:200],
-        "text": text,
-        "emails": _mailto_values(raw_html),
-        "phones": _tel_values(raw_html),
+        "text": visible_text[:1_200],
+        "emails": emails[:10],
+        "phones": phones[:10],
         "final_url": final_url,
     }
 
@@ -199,14 +272,51 @@ def _scrape_company(candidate: dict[str, Any]) -> dict[str, Any]:
     website = candidate["website_url"]
     pages: list[dict[str, Any]] = []
     warnings: list[str] = []
+    website_host = (urlsplit(website).hostname or "").removeprefix("www.")
+    homepage: dict[str, Any] | None = None
     for page_url in (website, urljoin(website, "/contact")):
         try:
             page = _page_content(page_url)
             if page:
+                page_host = (
+                    (urlsplit(page["final_url"]).hostname or "").removeprefix("www.")
+                )
+                if page_host != website_host and not page_host.endswith(
+                    f".{website_host}"
+                ):
+                    warnings.append(f"Skipped a page redirected away from {website_host}.")
+                    continue
                 pages.append(page)
+                if page_url == website:
+                    homepage = page
         except (requests.RequestException, ValueError, OSError) as exc:
             logger.info("Skipping page %s: %s", page_url, exc)
             warnings.append(f"Could not read {page_url}: {type(exc).__name__}.")
+
+    blocked_titles = (
+        "403 forbidden",
+        "404 not found",
+        "page not found",
+        "welcome to nginx",
+        "website coming soon",
+        "under construction",
+        "just a moment",
+        "domain for sale",
+        "buy this domain",
+        "parked domain",
+        "index of /",
+        "site not configured",
+        "default web site page",
+    )
+    homepage_text = homepage["text"].strip() if homepage else ""
+    homepage_title = homepage["title"].strip() if homepage else ""
+    verified = (
+        len(homepage_text) >= 100
+        and len(homepage_title) >= 2
+        and not any(marker in homepage_title.casefold() for marker in blocked_titles)
+    )
+    if not verified:
+        warnings.append(f"Could not verify a live company homepage at {website}.")
 
     emails = list(dict.fromkeys(email for page in pages for email in page["emails"]))
     phones = list(dict.fromkeys(phone for page in pages for phone in page["phones"]))
@@ -214,57 +324,101 @@ def _scrape_company(candidate: dict[str, Any]) -> dict[str, Any]:
     snippets = [page["text"] for page in pages if page["text"]]
     return {
         "candidate_id": candidate["candidate_id"],
+        "buyer_category": candidate["buyer_category"],
         "website_url": website,
         "search_title": candidate["search_title"],
         "page_titles": titles[:2],
         "emails": emails[:5],
         "phones": phones[:5],
         "site_text": " ".join(snippets)[:2_400],
+        "verified": verified,
         "warnings": warnings,
     }
 
 
-def _find_candidates(product: str, countries: list[str]) -> list[dict[str, Any]]:
-    query = (
-        f"{product} importers buyers distributors companies "
-        f"in {', '.join(countries)}"
-    )
+def _find_candidates(
+    product: str, countries: list[str], buyer_categories: list[str]
+) -> list[dict[str, Any]]:
     try:
-        results = DDGS().text(query, max_results=MAX_LEADS)
+        search = DDGS()
+        result_groups = []
+        for category in buyer_categories:
+            category_query = BUYER_CATEGORY_QUERIES[category]
+            for country in countries:
+                try:
+                    results = search.text(
+                        f"{product} {category_query} in {country} company website contact "
+                        "-directory -marketplace",
+                        max_results=MAX_RESULTS_PER_QUERY,
+                    )
+                except DDGSException as exc:
+                    if "no results found" not in str(exc).casefold():
+                        raise
+                    results = []
+                result_groups.append((category, results))
     except Exception as exc:
         logger.exception("DuckDuckGo search failed")
         raise HTTPException(status_code=502, detail="Company search provider failed.") from exc
 
+    candidate_groups: list[list[dict[str, Any]]] = []
+    for category, results in result_groups:
+        group: list[dict[str, Any]] = []
+        group_hosts: set[str] = set()
+        for result in results or []:
+            raw_url = result.get("href") or result.get("url")
+            if not isinstance(raw_url, str):
+                continue
+            try:
+                parsed = urlsplit(raw_url)
+                if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+                    continue
+                hostname = parsed.hostname.rstrip(".").lower()
+                if hostname.startswith("www."):
+                    hostname = hostname[4:]
+                if hostname in group_hosts:
+                    continue
+                website_url = _validated_web_url(raw_url)
+            except (ValueError, OSError):
+                continue
+            group_hosts.add(hostname)
+            title = str(result.get("title") or hostname)[:200]
+            if any(marker in title.casefold() for marker in DIRECTORY_TITLE_MARKERS):
+                continue
+            if any(
+                hostname == domain or hostname.endswith(f".{domain}")
+                for domain in DIRECTORY_DOMAINS
+            ):
+                continue
+            group.append(
+                {
+                    "website_url": website_url,
+                    "search_title": title,
+                    "buyer_category": category,
+                }
+            )
+        candidate_groups.append(group)
+
     candidates: list[dict[str, Any]] = []
     seen_hosts: set[str] = set()
-    for result in results or []:
-        raw_url = result.get("href") or result.get("url")
-        if not isinstance(raw_url, str):
-            continue
-        try:
-            parsed = urlsplit(raw_url)
-            if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+    for result_index in range(MAX_RESULTS_PER_QUERY):
+        for group in candidate_groups:
+            if result_index >= len(group):
                 continue
-            hostname = parsed.hostname.rstrip(".").lower()
-            if hostname.startswith("www."):
-                hostname = hostname[4:]
+            item = group[result_index]
+            hostname = (
+                (urlsplit(item["website_url"]).hostname or "").removeprefix("www.")
+            )
             if hostname in seen_hosts:
                 continue
-            website_url = _validated_web_url(
-                urlunsplit((parsed.scheme, parsed.netloc, "/", "", ""))
+            seen_hosts.add(hostname)
+            candidates.append(
+                {
+                    "candidate_id": len(candidates),
+                    **item,
+                }
             )
-        except (ValueError, OSError):
-            continue
-        seen_hosts.add(hostname)
-        candidates.append(
-            {
-                "candidate_id": len(candidates),
-                "website_url": website_url,
-                "search_title": str(result.get("title") or hostname)[:200],
-            }
-        )
-        if len(candidates) == MAX_LEADS:
-            break
+            if len(candidates) == MAX_LEADS:
+                return candidates
     return candidates
 
 
@@ -283,11 +437,15 @@ def _structure_leads(
         "null), phone (string or null), potential_buyer (boolean), and "
         "buyer_fit_reasoning (string). Copy public_email and phone exactly from "
         "the supplied extracted contact arrays, using null when an array is empty. "
-        "Use only evidence in the supplied "
-        "search title and website text. Do not invent company facts. Mark a company "
-        "a potential buyer only when the evidence reasonably indicates it may "
-        "purchase, import, distribute, or use the product; otherwise use false. "
-        "Keep reasoning concise and state when evidence is insufficient."
+        "Use only evidence in the supplied verified homepage title and website "
+        "text. Copy the company name from that evidence; do not infer a name from "
+        "the URL or search title. Do not invent company facts. Mark a company a "
+        "potential buyer in the candidate's selected buyer_category only when the "
+        "website clearly identifies a real business in a target country and gives "
+        "evidence it may purchase or use the product in that category. "
+        "Do not classify a company as a buyer merely because it is a distributor, "
+        "or because the search title matched. Otherwise use false. Keep reasoning "
+        "concise and state when evidence is insufficient."
     )
     user_payload = {
         "product": product,
@@ -297,6 +455,7 @@ def _structure_leads(
                 key: item[key]
                 for key in (
                     "candidate_id",
+                    "buyer_category",
                     "website_url",
                     "search_title",
                     "page_titles",
@@ -368,12 +527,45 @@ def _structure_leads(
         ) from exc
 
     leads: list[Lead] = []
+    seen_company_names: set[str] = set()
     for item in scraped:
         structured = indexed[item["candidate_id"]]
+        company_name = structured["company_name"].strip()[:200]
+        evidence = " ".join(item["page_titles"] + [item["site_text"]])
+        normalized_name = _normalized_company_name(company_name)
+        normalized_evidence = _normalized_company_name(evidence)
+        company_key = " ".join(
+            word
+            for word in normalized_name.split()
+            if word
+            not in {
+                "incorporated",
+                "corporation",
+                "company",
+                "limited",
+                "ltd",
+                "llc",
+                "plc",
+                "gmbh",
+                "pvt",
+                "private",
+                "pty",
+                "co",
+            }
+        )
+        if (
+            not structured["potential_buyer"]
+            or not normalized_name
+            or normalized_name not in normalized_evidence
+            or not company_key
+            or company_key in seen_company_names
+        ):
+            continue
+        seen_company_names.add(company_key)
         leads.append(
             Lead(
-                company_name=structured["company_name"].strip()[:200]
-                or item["search_title"],
+                company_name=company_name,
+                buyer_category=item["buyer_category"],
                 website_url=item["website_url"],
                 # Regex-extracted HTML values remain authoritative over model output.
                 public_email=", ".join(item["emails"]) or None,
@@ -385,8 +577,19 @@ def _structure_leads(
     return leads
 
 
+def _normalized_company_name(value: str) -> str:
+    return " ".join(
+        "".join(
+            character.casefold() if character.isalnum() else " "
+            for character in value
+        ).split()
+    )
+
+
 def _run_search(request: SearchRequest, api_key: str) -> SearchResponse:
-    candidates = _find_candidates(request.product, request.target_countries)
+    candidates = _find_candidates(
+        request.product, request.target_countries, request.buyer_categories
+    )
     warnings: list[str] = []
     scraped: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=8) as executor:
@@ -396,7 +599,8 @@ def _run_search(request: SearchRequest, api_key: str) -> SearchResponse:
             try:
                 result = future.result()
                 warnings.extend(result.pop("warnings"))
-                scraped.append(result)
+                if result.pop("verified"):
+                    scraped.append(result)
             except Exception as exc:
                 logger.exception("Could not scrape %s", candidate["website_url"])
                 warnings.append(
@@ -406,6 +610,12 @@ def _run_search(request: SearchRequest, api_key: str) -> SearchResponse:
     leads = _structure_leads(
         scraped, request.product, request.target_countries, api_key
     )
+    if len(leads) < len(scraped):
+        warnings.insert(
+            0,
+            f"Excluded {len(scraped) - len(leads)} websites without distinct, "
+            "verifiable buyer evidence.",
+        )
     return SearchResponse(
         leads=leads,
         searched_count=len(candidates),

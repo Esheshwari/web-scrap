@@ -39,13 +39,24 @@ The phone and computer should use the same Wi-Fi network.
 
    Scan the QR code with Expo Go. If Windows Firewall asks, allow access on your
    private network. On Android, you may need Expo Go's **Scan QR code** option.
-6. Enter a product and countries (for example, `Silk cloth` and `UAE, South
-   Africa`), then tap **Search Leads**. Allow a little time for the search.
-   Use **Export to CSV** to share the results.
+6. Enter a product (for example, `Rice`), select one or more clickable buyer
+   categories, enter target countries (for example, `UAE`), then tap **Search
+   Leads**. Results are searched for the selected categories and show the
+   category, company website, and publicly listed email/phone when found. Missing
+   contact details are shown as **Not found**. Use **Export to CSV** to share the
+   results.
+
+   A result is shown only when its homepage is reachable and the website text
+   supports the company name and potential buyer fit. This filter can return
+   fewer leads; open each website and verify the company before    contacting it.
 
 The `.env` file is local and ignored by Git. Expo only exposes variables prefixed
 with `EXPO_PUBLIC_` to the app; the Groq key is read by the Python backend.
 Do not share screenshots or logs that reveal your key.
+
+If a search reports that the server is missing `GROQ_API_KEY`, add a valid key
+to the local `.env` file, then restart the backend. The `/health` endpoint can
+still report healthy when the key is missing; a search will return HTTP 503.
 
 The backend uses Groq's `openai/gpt-oss-120b` model by default. If needed, set
 `GROQ_MODEL` in `.env` to another active model enabled for your account.
@@ -98,6 +109,12 @@ service to wake, checks `/health`, configures the API URL for EAS, validates the
 Expo app, and builds the APK. Download it from the completed run's **Artifacts**
 section. The Groq key belongs only in Render's environment; never add it to
 GitHub or the mobile app.
+
+An installed APK does not update when the source changes. Push the latest
+backend code to the branch deployed on Render and wait for that deployment to
+finish, then run this workflow and install the newly generated APK. The APK
+calls the backend URL embedded at build time, so rebuilding without deploying
+the updated backend can still return old search results.
 
 The APK needs an internet-accessible backend. If the Render health check or EAS
 build fails, open the failed workflow step for its error, then check the Render

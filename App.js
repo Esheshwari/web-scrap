@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   FlatList,
+  Linking,
   Platform,
   SafeAreaView,
   ScrollView,
@@ -17,8 +18,16 @@ import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_URL || 'http://YOUR_BACKEND_IP:8000';
+const BUYER_CATEGORIES = [
+  'Importer',
+  'Wholesaler',
+  'Retailer',
+  'Manufacturer/processor',
+  'Food-service buyer',
+];
 const LEAD_COLUMNS = [
   ['Company Name', 'company_name'],
+  ['Buyer Category', 'buyer_category'],
   ['Website URL', 'website_url'],
   ['Public Email', 'public_email'],
   ['Phone', 'phone'],
@@ -44,8 +53,10 @@ function createCsv(leads) {
 export default function App() {
   const [product, setProduct] = useState('');
   const [countriesText, setCountriesText] = useState('');
+  const [selectedCategories, setSelectedCategories] = useState([]);
   const [leads, setLeads] = useState([]);
   const [warnings, setWarnings] = useState([]);
+  const [searchError, setSearchError] = useState('');
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportMessage, setExportMessage] = useState('');
@@ -56,18 +67,27 @@ export default function App() {
       .map((country) => country.trim())
       .filter(Boolean);
 
-    if (!product.trim() || targetCountries.length === 0) {
-      Alert.alert('Missing details', 'Enter a product and at least one target country.');
+    if (!product.trim() || targetCountries.length === 0 || !selectedCategories.length) {
+      Alert.alert(
+        'Missing details',
+        'Enter a product, select at least one buyer category, and add a target country.',
+      );
       return;
     }
 
     setLoading(true);
+    setLeads([]);
     setWarnings([]);
+    setSearchError('');
     try {
       const response = await fetch(`${API_BASE_URL}/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ product: product.trim(), target_countries: targetCountries }),
+        body: JSON.stringify({
+          product: product.trim(),
+          target_countries: targetCountries,
+          buyer_categories: selectedCategories,
+        }),
       });
       const data = await response.json();
       if (!response.ok) {
@@ -76,13 +96,28 @@ export default function App() {
       setLeads(Array.isArray(data.leads) ? data.leads : []);
       setWarnings(Array.isArray(data.warnings) ? data.warnings : []);
       if (!data.leads?.length) {
-        Alert.alert('No leads found', 'Try a different product or target country.');
+        setSearchError('No verified leads were found. Try another category or country.');
       }
     } catch (error) {
-      Alert.alert('Search failed', error.message || 'Could not connect to the backend.');
+      const message = error.message || 'Could not connect to the backend.';
+      setSearchError(`Search failed: ${message}`);
+      if (Platform.OS !== 'web') {
+        Alert.alert('Search failed', message);
+      }
     } finally {
       setLoading(false);
     }
+  }
+
+  function toggleCategory(category) {
+    setSelectedCategories((current) =>
+      current.includes(category)
+        ? current.filter((item) => item !== category)
+        : [...current, category],
+    );
+    setLeads([]);
+    setWarnings([]);
+    setSearchError('');
   }
 
   async function exportCsv() {
@@ -136,8 +171,19 @@ export default function App() {
       <View style={styles.leadCard}>
         <Text style={styles.leadNumber}>LEAD {index + 1}</Text>
         <Text style={styles.companyName}>{item.company_name}</Text>
+        <Text style={styles.categoryBadge}>{item.buyer_category}</Text>
         <Text style={styles.label}>Website</Text>
-        <Text style={styles.value}>{item.website_url}</Text>
+        <Text
+          accessibilityRole="link"
+          onPress={() =>
+            Linking.openURL(item.website_url).catch(() =>
+              Alert.alert('Unable to open website', 'Check your internet connection and try again.'),
+            )
+          }
+          style={styles.websiteLink}
+        >
+          {item.website_url}
+        </Text>
         <Text style={styles.label}>Public email</Text>
         <Text style={styles.value}>{item.public_email || 'Not found'}</Text>
         <Text style={styles.label}>Phone</Text>
@@ -160,7 +206,7 @@ export default function App() {
         <Text style={styles.eyebrow}>B2B SALES RESEARCH</Text>
         <Text style={styles.title}>Find your next buyers</Text>
         <Text style={styles.subtitle}>
-          Discover companies that may need your product.
+          Find potential buyers using live company websites and buyer evidence.
         </Text>
 
         <View style={styles.formCard}>
@@ -173,6 +219,35 @@ export default function App() {
             style={styles.input}
             returnKeyType="next"
           />
+          {product.trim() ? (
+            <View style={styles.categorySection}>
+              <Text style={styles.inputLabel}>Buyer Category</Text>
+              <Text style={styles.categoryHint}>Choose one or more types of buyer to find.</Text>
+              <View style={styles.categoryList}>
+                {BUYER_CATEGORIES.map((category) => {
+                  const selected = selectedCategories.includes(category);
+                  return (
+                    <TouchableOpacity
+                      key={category}
+                      accessibilityRole="button"
+                      accessibilityState={{ selected }}
+                      onPress={() => toggleCategory(category)}
+                      style={[styles.categoryChip, selected && styles.categoryChipSelected]}
+                    >
+                      <Text
+                        style={[
+                          styles.categoryChipText,
+                          selected && styles.categoryChipTextSelected,
+                        ]}
+                      >
+                        {category}
+                      </Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            </View>
+          ) : null}
           <Text style={styles.inputLabel}>Target Countries</Text>
           <TextInput
             value={countriesText}
@@ -186,8 +261,11 @@ export default function App() {
           <TouchableOpacity
             accessibilityRole="button"
             onPress={searchLeads}
-            disabled={loading}
-            style={[styles.searchButton, loading && styles.buttonDisabled]}
+            disabled={loading || !selectedCategories.length}
+            style={[
+              styles.searchButton,
+              (loading || !selectedCategories.length) && styles.buttonDisabled,
+            ]}
           >
             {loading ? (
               <ActivityIndicator color="#ffffff" />
@@ -197,9 +275,16 @@ export default function App() {
           </TouchableOpacity>
         </View>
 
+        {searchError ? (
+          <View style={styles.errorBox}>
+            <Text style={styles.errorTitle}>Search not completed</Text>
+            <Text style={styles.errorText}>{searchError}</Text>
+          </View>
+        ) : null}
+
         {warnings.length > 0 && (
           <View style={styles.warningBox}>
-            <Text style={styles.warningTitle}>Some sites could not be checked</Text>
+            <Text style={styles.warningTitle}>Search quality notes</Text>
             {warnings.slice(0, 3).map((warning, index) => (
               <Text key={`${index}-${warning}`} style={styles.warningText}>
                 {warning}
@@ -241,7 +326,7 @@ export default function App() {
           <View style={styles.emptyState}>
             <Text style={styles.emptyTitle}>No leads yet</Text>
             <Text style={styles.emptyText}>
-              Enter a product and target market to start your search.
+              Enter a product, choose buyer categories, and add target countries to search.
             </Text>
           </View>
         )}
@@ -277,6 +362,20 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     marginBottom: 16,
   },
+  categorySection: { marginBottom: 16 },
+  categoryHint: { color: '#758198', fontSize: 12, marginTop: -4, marginBottom: 10 },
+  categoryList: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  categoryChip: {
+    backgroundColor: '#f4f7fb',
+    borderColor: '#dce3ed',
+    borderRadius: 18,
+    borderWidth: 1,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  categoryChipSelected: { backgroundColor: '#e8f4f0', borderColor: '#176b58' },
+  categoryChipText: { color: '#52627a', fontSize: 12, fontWeight: '600' },
+  categoryChipTextSelected: { color: '#176b58' },
   searchButton: {
     alignItems: 'center',
     backgroundColor: '#176b58',
@@ -297,6 +396,16 @@ const styles = StyleSheet.create({
   },
   warningTitle: { color: '#714e0d', fontSize: 13, fontWeight: '700', marginBottom: 5 },
   warningText: { color: '#765f35', fontSize: 12, marginTop: 3 },
+  errorBox: {
+    backgroundColor: '#fff0f0',
+    borderColor: '#f0caca',
+    borderRadius: 12,
+    borderWidth: 1,
+    marginTop: 16,
+    padding: 13,
+  },
+  errorTitle: { color: '#8a2929', fontSize: 13, fontWeight: '700', marginBottom: 5 },
+  errorText: { color: '#733b3b', fontSize: 12, lineHeight: 18 },
   resultsHeader: {
     alignItems: 'center',
     flexDirection: 'row',
@@ -325,8 +434,20 @@ const styles = StyleSheet.create({
   },
   leadNumber: { color: '#176b58', fontSize: 10, fontWeight: '800', letterSpacing: 1 },
   companyName: { color: '#15243a', fontSize: 17, fontWeight: '800', marginTop: 5, marginBottom: 10 },
+  categoryBadge: {
+    alignSelf: 'flex-start',
+    backgroundColor: '#e8f4f0',
+    borderRadius: 12,
+    color: '#176b58',
+    fontSize: 11,
+    fontWeight: '700',
+    overflow: 'hidden',
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+  },
   label: { color: '#718098', fontSize: 11, fontWeight: '700', marginTop: 8, textTransform: 'uppercase' },
   value: { color: '#263750', fontSize: 13, marginTop: 3 },
+  websiteLink: { color: '#176b58', fontSize: 13, marginTop: 3, textDecorationLine: 'underline' },
   fitHeader: { alignItems: 'center', flexDirection: 'row', justifyContent: 'space-between' },
   fitYes: { color: '#176b58', fontSize: 11, fontWeight: '700', marginTop: 8 },
   fitUnclear: { color: '#8b650f', fontSize: 11, fontWeight: '700', marginTop: 8 },
