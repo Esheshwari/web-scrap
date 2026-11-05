@@ -33,8 +33,8 @@ MAX_RESULTS_PER_QUERY = 6
 SEARCH_BACKENDS = ("yahoo", "duckduckgo", "startpage", "mojeek", "brave")
 USER_AGENT = "B2BLeadResearch/1.0 (+public company contact research)"
 BUYER_CATEGORY_QUERIES = {
-    "Importer": "importer purchasing company",
-    "Wholesaler": "wholesaler bulk buyer",
+    "Importer": "importer",
+    "Wholesaler": "wholesaler",
     "Retailer": "retailer supermarket grocery store",
     "Manufacturer/processor": "manufacturer food processor",
     "Food-service buyer": "restaurant hotel catering food service procurement",
@@ -351,6 +351,8 @@ def _is_company_search_result(result: Any) -> bool:
         return False
 
     hostname = parsed.hostname.rstrip(".").lower().removeprefix("www.")
+    if hostname == "bing.com" and parsed.path.casefold().startswith("/aclick"):
+        return False
     title = str(result.get("title") or hostname).casefold()
     if any(marker in title for marker in DIRECTORY_TITLE_MARKERS):
         return False
@@ -376,41 +378,49 @@ def _find_candidates(
     for category in buyer_categories:
         category_query = BUYER_CATEGORY_QUERIES[category]
         for country in countries:
-            query = (
-                f"{product} {category_query} in {country} company website contact "
-                "-directory -marketplace"
+            queries = (
+                f"{product} {category_query} {country} company official website",
+                f"{product} {category_query} in {country}",
+                f"{product} {category_query} {country} trading company",
             )
             results: list[dict[str, Any]] = []
             seen_result_hosts: set[str] = set()
             provider_errors: list[str] = []
             query_responded = False
-            for backend in SEARCH_BACKENDS:
-                try:
-                    backend_results = search.text(
-                        query,
-                        max_results=MAX_RESULTS_PER_QUERY,
-                        backend=backend,
-                    )
-                    query_responded = True
-                except Exception as exc:
-                    if "no results found" in str(exc).casefold():
+            for query in queries:
+                for backend in SEARCH_BACKENDS:
+                    try:
+                        backend_results = search.text(
+                            query,
+                            max_results=MAX_RESULTS_PER_QUERY,
+                            backend=backend,
+                        )
                         query_responded = True
-                    else:
-                        provider_errors.append(f"{backend}: {type(exc).__name__}")
-                    continue
+                    except Exception as exc:
+                        if "no results found" in str(exc).casefold():
+                            query_responded = True
+                        else:
+                            provider_errors.append(f"{backend}: {type(exc).__name__}")
+                        continue
 
-                for result in backend_results or []:
-                    if not _is_company_search_result(result):
-                        continue
-                    raw_url = result.get("href") or result.get("url")
-                    hostname = (urlsplit(raw_url).hostname or "").lower().removeprefix("www.")
-                    if hostname in seen_result_hosts:
-                        continue
-                    seen_result_hosts.add(hostname)
-                    results.append(result)
+                    for result in backend_results or []:
+                        if not _is_company_search_result(result):
+                            continue
+                        raw_url = result.get("href") or result.get("url")
+                        hostname = (
+                            (urlsplit(raw_url).hostname or "")
+                            .lower()
+                            .removeprefix("www.")
+                        )
+                        if hostname in seen_result_hosts:
+                            continue
+                        seen_result_hosts.add(hostname)
+                        results.append(result)
+                        if len(results) >= MAX_RESULTS_PER_QUERY:
+                            break
                     if len(results) >= MAX_RESULTS_PER_QUERY:
                         break
-                if len(results) >= MAX_RESULTS_PER_QUERY:
+                if results:
                     break
 
             if provider_errors and not results:
