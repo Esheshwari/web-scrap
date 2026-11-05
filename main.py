@@ -12,7 +12,6 @@ from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
-from ddgs.exceptions import DDGSException
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -31,6 +30,7 @@ REQUEST_TIMEOUT = (5, 12)
 MAX_REDIRECTS = 4
 MAX_LEADS = 20
 MAX_RESULTS_PER_QUERY = 6
+SEARCH_FALLBACK_BACKENDS = ("duckduckgo", "startpage", "mojeek", "yahoo", "brave")
 USER_AGENT = "B2BLeadResearch/1.0 (+public company contact research)"
 BUYER_CATEGORY_QUERIES = {
     "Importer": "importer purchasing company",
@@ -352,28 +352,48 @@ def _find_candidates(
     for category in buyer_categories:
         category_query = BUYER_CATEGORY_QUERIES[category]
         for country in countries:
+            query = (
+                f"{product} {category_query} in {country} company website contact "
+                "-directory -marketplace"
+            )
             try:
-                results = search.text(
-                    f"{product} {category_query} in {country} company website contact "
-                    "-directory -marketplace",
-                    max_results=MAX_RESULTS_PER_QUERY,
-                )
-            except DDGSException as exc:
-                if "no results found" in str(exc).casefold():
-                    results = []
-                else:
+                results = search.text(query, max_results=MAX_RESULTS_PER_QUERY)
+            except Exception as auto_error:
+                results = []
+                last_error = auto_error
+                provider_failed = "no results found" not in str(auto_error).casefold()
+                for backend in SEARCH_FALLBACK_BACKENDS:
+                    try:
+                        results = search.text(
+                            query,
+                            max_results=MAX_RESULTS_PER_QUERY,
+                            backend=backend,
+                        )
+                        if results:
+                            logger.info(
+                                "Company search succeeded with fallback backend %s "
+                                "for category %s in %s",
+                                backend,
+                                category,
+                                country,
+                            )
+                            break
+                    except Exception as fallback_error:
+                        last_error = fallback_error
+                        if "no results found" not in str(fallback_error).casefold():
+                            provider_failed = True
+                if not results and provider_failed:
                     failed_queries += 1
                     logger.warning(
-                        "Company search provider failed for category %s in %s: %s",
+                        "Company search providers failed for category %s in %s: %s",
                         category,
                         country,
-                        exc,
+                        last_error,
                     )
                     search_warnings.append(
                         f"Search provider failed for {category} in {country}; "
                         "results may be incomplete."
                     )
-                    results = []
             result_groups.append((category, results))
 
     if failed_queries == total_queries:
