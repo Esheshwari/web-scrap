@@ -30,7 +30,7 @@ REQUEST_TIMEOUT = (5, 12)
 MAX_REDIRECTS = 4
 MAX_LEADS = 20
 MAX_RESULTS_PER_QUERY = 6
-SEARCH_FALLBACK_BACKENDS = ("duckduckgo", "startpage", "mojeek", "yahoo", "brave")
+SEARCH_BACKENDS = ("yahoo", "duckduckgo", "startpage", "mojeek", "brave")
 USER_AGENT = "B2BLeadResearch/1.0 (+public company contact research)"
 BUYER_CATEGORY_QUERIES = {
     "Importer": "importer purchasing company",
@@ -59,6 +59,7 @@ DIRECTORY_TITLE_MARKERS = (
     "supplier directory",
     "suppliers list",
     "company directory",
+    "directory",
     "marketplace",
     "trade data",
     "import data",
@@ -336,6 +337,29 @@ def _scrape_company(candidate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_company_search_result(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    raw_url = result.get("href") or result.get("url")
+    if not isinstance(raw_url, str):
+        return False
+    try:
+        parsed = urlsplit(raw_url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+            return False
+    except ValueError:
+        return False
+
+    hostname = parsed.hostname.rstrip(".").lower().removeprefix("www.")
+    title = str(result.get("title") or hostname).casefold()
+    if any(marker in title for marker in DIRECTORY_TITLE_MARKERS):
+        return False
+    return not any(
+        hostname == domain or hostname.endswith(f".{domain}")
+        for domain in DIRECTORY_DOMAINS
+    )
+
+
 def _find_candidates(
     product: str, countries: list[str], buyer_categories: list[str]
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -356,49 +380,52 @@ def _find_candidates(
                 f"{product} {category_query} in {country} company website contact "
                 "-directory -marketplace"
             )
-            try:
-                results = search.text(query, max_results=MAX_RESULTS_PER_QUERY)
-            except Exception as auto_error:
-                results = []
-                last_error = auto_error
-                query_responded = "no results found" in str(auto_error).casefold()
-                provider_failed = not query_responded
-                for backend in SEARCH_FALLBACK_BACKENDS:
-                    try:
-                        results = search.text(
-                            query,
-                            max_results=MAX_RESULTS_PER_QUERY,
-                            backend=backend,
-                        )
+            results: list[dict[str, Any]] = []
+            seen_result_hosts: set[str] = set()
+            provider_errors: list[str] = []
+            query_responded = False
+            for backend in SEARCH_BACKENDS:
+                try:
+                    backend_results = search.text(
+                        query,
+                        max_results=MAX_RESULTS_PER_QUERY,
+                        backend=backend,
+                    )
+                    query_responded = True
+                except Exception as exc:
+                    if "no results found" in str(exc).casefold():
                         query_responded = True
-                        if results:
-                            logger.info(
-                                "Company search succeeded with fallback backend %s "
-                                "for category %s in %s",
-                                backend,
-                                category,
-                                country,
-                            )
+                    else:
+                        provider_errors.append(f"{backend}: {type(exc).__name__}")
+                    continue
+
+                for result in backend_results or []:
+                    if not _is_company_search_result(result):
+                        continue
+                    raw_url = result.get("href") or result.get("url")
+                    hostname = (urlsplit(raw_url).hostname or "").lower().removeprefix("www.")
+                    if hostname in seen_result_hosts:
+                        continue
+                    seen_result_hosts.add(hostname)
+                    results.append(result)
+                    if len(results) >= MAX_RESULTS_PER_QUERY:
                         break
-                    except Exception as fallback_error:
-                        last_error = fallback_error
-                        if "no results found" in str(fallback_error).casefold():
-                            query_responded = True
-                        else:
-                            provider_failed = True
-                if provider_failed:
-                    logger.warning(
-                        "A company search provider failed for category %s in %s: %s",
-                        category,
-                        country,
-                        last_error,
-                    )
-                    search_warnings.append(
-                        f"Some search providers failed for {category} in {country}; "
-                        "results may be incomplete."
-                    )
-                if not results and not query_responded:
-                    failed_queries += 1
+                if len(results) >= MAX_RESULTS_PER_QUERY:
+                    break
+
+            if provider_errors and not results:
+                logger.warning(
+                    "Company search providers unavailable for category %s in %s: %s",
+                    category,
+                    country,
+                    ", ".join(provider_errors),
+                )
+                search_warnings.append(
+                    f"Some search providers were unavailable for {category} in "
+                    f"{country}; other providers were tried."
+                )
+            if not query_responded:
+                failed_queries += 1
             result_groups.append((category, results))
 
     if failed_queries == total_queries:
@@ -683,6 +710,18 @@ def _run_search(request: SearchRequest, api_key: str) -> SearchResponse:
             0,
             f"Excluded {len(scraped) - len(leads)} websites without distinct, "
             "verifiable buyer evidence.",
+        )
+    if not candidates:
+        warnings.insert(
+            0,
+            "Search providers returned no usable company websites. Try another "
+            "country, category, or a more specific product name.",
+        )
+    elif not scraped:
+        warnings.insert(
+            0,
+            "Search results were found, but none had a verifiable live company "
+            "homepage. Try another country or category.",
         )
     return SearchResponse(
         leads=leads,

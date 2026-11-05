@@ -57,6 +57,7 @@ export default function App() {
   const [leads, setLeads] = useState([]);
   const [warnings, setWarnings] = useState([]);
   const [searchError, setSearchError] = useState('');
+  const [searchCompleted, setSearchCompleted] = useState(false);
   const [loading, setLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportMessage, setExportMessage] = useState('');
@@ -79,6 +80,7 @@ export default function App() {
     setLeads([]);
     setWarnings([]);
     setSearchError('');
+    setSearchCompleted(false);
     try {
       const response = await fetch(`${API_BASE_URL}/search`, {
         method: 'POST',
@@ -95,12 +97,11 @@ export default function App() {
       }
       setLeads(Array.isArray(data.leads) ? data.leads : []);
       setWarnings(Array.isArray(data.warnings) ? data.warnings : []);
-      if (!data.leads?.length) {
-        setSearchError('No verified leads were found. Try another category or country.');
-      }
+      setSearchCompleted(true);
     } catch (error) {
       const message = error.message || 'Could not connect to the backend.';
       setSearchError(`Search failed: ${message}`);
+      setSearchCompleted(false);
       if (Platform.OS !== 'web') {
         Alert.alert('Search failed', message);
       }
@@ -118,6 +119,7 @@ export default function App() {
     setLeads([]);
     setWarnings([]);
     setSearchError('');
+    setSearchCompleted(false);
   }
 
   async function exportCsv() {
@@ -324,9 +326,13 @@ export default function App() {
           />
         ) : (
           <View style={styles.emptyState}>
-            <Text style={styles.emptyTitle}>No leads yet</Text>
+            <Text style={styles.emptyTitle}>
+              {searchCompleted ? 'No verified leads found' : 'No leads yet'}
+            </Text>
             <Text style={styles.emptyText}>
-              Enter a product, choose buyer categories, and add target countries to search.
+              {searchCompleted
+                ? 'The search finished, but no live company websites passed buyer verification. Try another country, category, or product description.'
+                : 'Enter a product, choose buyer categories, and add target countries to search.'}
             </Text>
           </View>
         )}
