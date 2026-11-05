@@ -361,7 +361,8 @@ def _find_candidates(
             except Exception as auto_error:
                 results = []
                 last_error = auto_error
-                provider_failed = "no results found" not in str(auto_error).casefold()
+                query_responded = "no results found" in str(auto_error).casefold()
+                provider_failed = not query_responded
                 for backend in SEARCH_FALLBACK_BACKENDS:
                     try:
                         results = search.text(
@@ -369,6 +370,7 @@ def _find_candidates(
                             max_results=MAX_RESULTS_PER_QUERY,
                             backend=backend,
                         )
+                        query_responded = True
                         if results:
                             logger.info(
                                 "Company search succeeded with fallback backend %s "
@@ -377,23 +379,26 @@ def _find_candidates(
                                 category,
                                 country,
                             )
-                            break
+                        break
                     except Exception as fallback_error:
                         last_error = fallback_error
-                        if "no results found" not in str(fallback_error).casefold():
+                        if "no results found" in str(fallback_error).casefold():
+                            query_responded = True
+                        else:
                             provider_failed = True
-                if not results and provider_failed:
-                    failed_queries += 1
+                if provider_failed:
                     logger.warning(
-                        "Company search providers failed for category %s in %s: %s",
+                        "A company search provider failed for category %s in %s: %s",
                         category,
                         country,
                         last_error,
                     )
                     search_warnings.append(
-                        f"Search provider failed for {category} in {country}; "
+                        f"Some search providers failed for {category} in {country}; "
                         "results may be incomplete."
                     )
+                if not results and not query_responded:
+                    failed_queries += 1
             result_groups.append((category, results))
 
     if failed_queries == total_queries:
