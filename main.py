@@ -338,27 +338,46 @@ def _scrape_company(candidate: dict[str, Any]) -> dict[str, Any]:
 
 def _find_candidates(
     product: str, countries: list[str], buyer_categories: list[str]
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[str]]:
     try:
         search = DDGS()
-        result_groups = []
-        for category in buyer_categories:
-            category_query = BUYER_CATEGORY_QUERIES[category]
-            for country in countries:
-                try:
-                    results = search.text(
-                        f"{product} {category_query} in {country} company website contact "
-                        "-directory -marketplace",
-                        max_results=MAX_RESULTS_PER_QUERY,
-                    )
-                except DDGSException as exc:
-                    if "no results found" not in str(exc).casefold():
-                        raise
-                    results = []
-                result_groups.append((category, results))
     except Exception as exc:
         logger.exception("DuckDuckGo search failed")
         raise HTTPException(status_code=502, detail="Company search provider failed.") from exc
+
+    result_groups = []
+    search_warnings: list[str] = []
+    failed_queries = 0
+    total_queries = len(buyer_categories) * len(countries)
+    for category in buyer_categories:
+        category_query = BUYER_CATEGORY_QUERIES[category]
+        for country in countries:
+            try:
+                results = search.text(
+                    f"{product} {category_query} in {country} company website contact "
+                    "-directory -marketplace",
+                    max_results=MAX_RESULTS_PER_QUERY,
+                )
+            except DDGSException as exc:
+                if "no results found" in str(exc).casefold():
+                    results = []
+                else:
+                    failed_queries += 1
+                    logger.warning(
+                        "Company search provider failed for category %s in %s: %s",
+                        category,
+                        country,
+                        exc,
+                    )
+                    search_warnings.append(
+                        f"Search provider failed for {category} in {country}; "
+                        "results may be incomplete."
+                    )
+                    results = []
+            result_groups.append((category, results))
+
+    if failed_queries == total_queries:
+        raise HTTPException(status_code=502, detail="Company search provider failed.")
 
     candidate_groups: list[list[dict[str, Any]]] = []
     for category, results in result_groups:
@@ -418,8 +437,8 @@ def _find_candidates(
                 }
             )
             if len(candidates) == MAX_LEADS:
-                return candidates
-    return candidates
+                return candidates, search_warnings
+    return candidates, search_warnings
 
 
 def _structure_leads(
@@ -612,10 +631,9 @@ def _normalized_company_name(value: str) -> str:
 
 
 def _run_search(request: SearchRequest, api_key: str) -> SearchResponse:
-    candidates = _find_candidates(
+    candidates, warnings = _find_candidates(
         request.product, request.target_countries, request.buyer_categories
     )
-    warnings: list[str] = []
     scraped: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = {executor.submit(_scrape_company, item): item for item in candidates}
